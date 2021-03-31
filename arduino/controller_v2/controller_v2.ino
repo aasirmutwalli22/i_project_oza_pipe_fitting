@@ -1,7 +1,7 @@
 #include "LiquidCrystal.h"
 #include "Wire.h"
 #include "extensions.h"
-#include "ds1307.h"
+#include "RTClib.h"
 const byte    decButtonPin      = 4;
 const byte    setButtonPin      = 5;
 const byte    incButtonPin      = 3;
@@ -12,6 +12,7 @@ const byte    tempPin           = A0;//lm35
 const byte    currentPin        = A1;//ct
 const byte    voltagePin        = A3;
 
+RTC_DS1307 rtc;
 LiquidCrystal lcd(6, 7, 8, 9, 10, 11);
 
 const char    types[7][8]       = {"Coupler", "Elbow", "Tee", "Reducer", "Saddle", "Endcap", "Other" };
@@ -34,7 +35,8 @@ const float   voltages[3]       = {40.0, 39.5, 39.0};
    disconnect : 10
   **/
 float         temp              = 0.0;
-float         voltage           = 40;
+float         voltage           = 0;
+float         current           = 0.0;
 byte          error             = 0;
 byte          screen            = 0;
 byte          pipe_type_select  = 0;
@@ -45,17 +47,6 @@ unsigned int  timer             = 0;  // 0 to 999 // actual timer
 byte          selection_index   = 0;  // 0 : pipe type, 1 : diameter, 2 : sec(time)
 byte          blink_counter     = 0;
 unsigned long last_millis       = 0; // for counter
-
-rtcData new_time = {
-  0,//second
-  16,//minute
-  4,//hour
-  4,//week_day
-  17,//date
-  3,//month
-  21//year
-};
-rtcData time;
 
 void setup() {
   Wire.begin();
@@ -68,14 +59,28 @@ void setup() {
   pinMode(buzzerPin, OUTPUT);
 
   Serial.begin(9600);
-  lcd.begin(20, 4);
+  lcd.begin(20, 4);//rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  if (! rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    Serial.flush();
+  }
+  if (! rtc.isrunning()) {
+    Serial.println("RTC is NOT running, let's set the time!");
+    // When time needs to be set on a new device, or after a power loss, the
+    // following line sets the RTC to the date & time this sketch was compiled
+//    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    // This line sets the RTC with an explicit date & time, for example to set
+    // January 21, 2014 at 3am you would call:
+    // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
+  }
 //  RTC.set(new_time);
+  delay(1000);
   monitor();
-
+  monitor_voltage();
   for(int i = 0; i < 6; i++){
     screen = i;
     screen_display();                      // change screen
-    delay(2000);
+    delay(1000);
   }
 }
 
@@ -149,13 +154,27 @@ void screen_handle() {
         selection_index = 0;
         blink_counter = 0;
         --screen;
-      } else nextScreen();
+      } else if (onSetButton()) {
+        monitor_voltage();
+        if(error > 0) {
+          screen = 99;
+          break;
+        }
+        last_millis = millis();
+        digitalWrite(relayPin, HIGH);
+        delay(500);
+        monitor();
+        if(error > 0) {
+          screen = 99;
+          break;
+        }
+        screen = 8;
+      }
       break;
     }
     case 8 :{ // process started
       monitor();
       if(error > 0) screen = 99;
-      digitalWrite(relayPin, HIGH);
       delay(500);
       if (millis() > last_millis + 1000) {
         last_millis = millis();
@@ -188,10 +207,10 @@ void screen_handle() {
       break;
     }
     case 99:{ // error display
-//      digitalWrite(relayPin, LOW);
+      digitalWrite(relayPin, LOW);
       selection_index = 0;
       blink_counter = 0;
-      if(onSetButton()) screen = 5;
+      if(onSetButton()) screen = 5, error = 0;
       break;
     }
     default:{
@@ -240,8 +259,13 @@ void screen_display() {
       break;
     }
     case 4 : {// time and temp
+      DateTime now = rtc.now();
+      char ti[21];
+      sprintf(ti, "%.2d/%.2d/%.2d %.2d:%.2d:%.2d m", now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second());
+      now.hour() >= 12 ? ti[19] = 'p' : 'a';
+      
       lcd.setCursor(0, 0);
-      lcd.print(RTC.readString(time));//19 char
+      lcd.print(ti);//19 char
       lcd.print(" ");
       lcd.setCursor(0, 1);
       lcd.print(F("                    "));
@@ -347,7 +371,8 @@ void screen_display() {
       lcd.setCursor(0, 1);
       lcd.print(error_message());
       lcd.setCursor(0, 2);
-      lcd.print(voltage);
+//      lcd.print(voltage);
+      lcd.print(F("                    "));
       lcd.setCursor(0, 3);
       lcd.print(F("                    "));
       delay(500);
@@ -370,40 +395,84 @@ void screen_display() {
 
 
 String error_message(){
+//  Serial.print("error: ");
+//  Serial.println(error);
   return error == 1  ? "AMBIENT TEMP LOW    " :
   error == 2  ? "AMBIENT TEMP HIGH   " :
+  error == 4  ? "CURRENT OUT OF RANGE" :
+  error == 5  ? "FUSION OPEN CIRCUIT " :
   error == 22 ? "FUSION CYCLE STOPPED" :
   error == 23 ? "MAINS VOLTAGE LOW   " :
   error == 24 ? "MAINS VOLTAGE HIGH  " : "                ";
-  Serial.print("error: ");
-  Serial.println(error);
 }
 void monitor() {
   delay(50);
   temp = read_temp();
-  voltage = (int) read_voltage();
   
-  if(screen == 8) voltage *= 1.126;
+//  if(screen == 8) voltage *= 1.126;
+  current = read_current();
    
   if     (temp    < -10.0)  error = 1;
   else if(temp    > 45.0 )  error = 2;
-  else if(voltage < 220.0)  error = 23;
-  else if(voltage > 250.0)  error = 24;
+  else if(screen == 7 && current < 1) error = 5; // on start check  // open loop
+  else if(screen == 8 && current < 1) error = 4; // process started // fittings broken
 //  else error = 0;
+}
+void monitor_voltage(){
+  voltage = (int) read_voltage();
+  if(voltage < 220.0)  error = 23;
+  else if(voltage > 250.0)  error = 24;
 }
 float read_voltage(){
   long val = 0;
-  for(int i = 0; i < 100; i++) val += analogRead(voltagePin);
-  val /= 100;
-  return val * 0.34575260804769001490312965722802;
+  for(int i = 0; i < 1000; i++) val += analogRead(voltagePin);
+  val /= 1000;
+  //
+//  return val * 0.34575260804769001490312965722802
+  return val/1.72;
 }
 float read_temp(){
   long val = 0;
   for(int i = 0; i < 100; i++) val += analogRead(tempPin);
   val /= 100;
-  return val * 500.0 / 1023.0;
+  float _temp = val * 500.0 / 1023.0;
+  return _temp * 0.76726342710997442455242966751918;
+}
+float getVPP()
+{
+  float result;
+  int readValue;             //value read from the sensor
+  int maxValue = 0;          // store max value here
+  long int avgVal = 0;
+  uint32_t start_time = millis();
+  int i = 0;
+  while ((millis() - start_time) < 100){
+      readValue = analogRead(currentPin);
+      avgVal = avgVal + readValue;
+      if (readValue > maxValue){
+        maxValue = readValue;
+      }
+      i++;
+
+  }
+  maxValue = (maxValue - (avgVal / i));
+  result = (maxValue * 5.0) / 1024.0;
+  return result;
 }
 
+float read_current()
+{
+  float nVPP = getVPP();
+  nVPP = (nVPP / 2) * 0.707 * 1000.0;
+  float nCurrThruResistorPP = (nVPP) / 56.0;
+  float nCurrThruResistorRMS = (nCurrThruResistorPP); //-8.06
+  float nCurrentThruWire = nCurrThruResistorRMS * 1000;
+
+  if (nCurrThruResistorRMS < 1.0){
+    nCurrThruResistorRMS = 0;
+  }
+  return (nCurrThruResistorPP);
+}
 
 
 bool onModeButton() {
